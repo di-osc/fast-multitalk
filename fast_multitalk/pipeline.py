@@ -1,6 +1,5 @@
 import json
 import math
-import os
 import random
 from contextlib import contextmanager
 from functools import partial
@@ -818,7 +817,7 @@ class MultiTalkPipeline:
         end_time = time.time()
         logger.info(f"Generation time: {end_time - start_time} seconds")
         if video_save_path is None:
-            video_save_path = "multitalk_video.mp4"
+            video_save_path = f"multitalk_video_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
         save_video_ffmpeg(
             save_path=video_save_path,
             gen_video_samples=gen_video_samples[0],
