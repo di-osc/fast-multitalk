@@ -9,7 +9,6 @@ from transformers import Wav2Vec2FeatureExtractor
 import numpy as np
 import torch
 import pyloudnorm as pyln
-import soundfile as sf
 
 from ..models.wav2vec import Wav2Vec2Model
 
@@ -57,9 +56,10 @@ class AudioEncoder:
         audio_emb = audio_emb.cpu().detach()
         return audio_emb
 
-    def process_input_data(self, input_json_path: str) -> dict:
-        with open(input_json_path, "r") as f:
-            input_data = json.load(f)
+    def process_input_data(self, input_data: str | dict) -> dict:
+        if isinstance(input_data, str):
+            with open(input_data, "r") as f:
+                input_data = json.load(f)
         if len(input_data["cond_audio"]) == 2:
             new_human_speech1, new_human_speech2, sum_human_speechs = (
                 audio_prepare_multi(

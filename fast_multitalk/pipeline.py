@@ -1,16 +1,15 @@
 import json
 import math
 import random
+import time
 from contextlib import contextmanager
 from functools import partial
 from PIL import Image
-import time
-from typing import Literal
+from typing import Literal, Any
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 import torch.nn as nn
 from tqdm import tqdm
@@ -41,6 +40,7 @@ from .utils import (
     resize_and_centercrop,
     to_param_dtype_fp32only,
     timestep_transform,
+    seed_everything,
 )
 from .data import save_video_ffmpeg
 
@@ -56,6 +56,8 @@ class MultiTalkPipeline:
         use_timestep_transform: bool = True,
         quant: Literal["int8", "fp8"] | None = "int8",
         distill_model: Literal["lightx2v", "FusionX"] = "lightx2v",
+        low_vram_mode: bool = True,
+        num_persistent_param_in_dit: int = 10_000_000_000,
     ):
         """
         Initializes the image-to-video generation model components.
@@ -137,9 +139,17 @@ class MultiTalkPipeline:
         self.num_timesteps = num_timesteps
         self.use_timestep_transform = use_timestep_transform
 
-        self.cpu_offload = False
         self.model_names = ["model"]
+        self.cpu_offload = False
         self.vram_management = False
+        if low_vram_mode:
+            logger.info(
+                f"Enable low vram mode with num_persistent_param_in_dit: {num_persistent_param_in_dit}"
+            )
+            self.enable_vram_management(
+                num_persistent_param_in_dit=num_persistent_param_in_dit
+            )
+            self.enable_cpu_offload()
 
     def add_noise(
         self,
@@ -236,18 +246,16 @@ class MultiTalkPipeline:
 
     def generate(
         self,
-        input_json_path: str,
+        input_data: str | dict,
         video_save_path: str = None,
-        size_buckget: Literal["multitalk-480", "multitalk-720"] = "multitalk-480",
         motion_frame: int = 25,
         frame_num: int = 81,
         shift: float = 5.0,
-        sampling_steps: int = 10,
+        sample_steps: int = 10,
         text_guide_scale: float = 1.0,
         audio_guide_scale: float = 2.0,
         n_prompt: str = "",
-        seed: int = -1,
-        offload_model: bool = True,
+        seed: int = 42,
         max_frames_num: int = 1000,
         face_scale: float = 0.05,
         progress: bool = True,
@@ -257,53 +265,53 @@ class MultiTalkPipeline:
         use_apg: bool = False,
         apg_momentum: float = -0.75,
         apg_norm_threshold: float = 55,
+        **kwargs: Any,
     ):
-        r"""
-        Generates video frames from input image and text prompt using diffusion process.
-
-        Args:
-            frame_num (`int`, *optional*, defaults to 81):
-                How many frames to sample from a video. The number should be 4n+1
-            shift (`float`, *optional*, defaults to 5.0):
-                Noise schedule shift parameter. Affects temporal dynamics
-                [NOTE]: If you want to generate a 480p video, it is recommended to set the shift value to 3.0.
-            sampling_steps (`int`, *optional*, defaults to 40):
-                Number of diffusion sampling steps. Higher values improve quality but slow generation
-            n_prompt (`str`, *optional*, defaults to ""):
-                Negative prompt for content exclusion. If not given, use `config.sample_neg_prompt`
-            seed (`int`, *optional*, defaults to -1):
-                Random seed for noise generation. If -1, use random seed
-            offload_model (`bool`, *optional*, defaults to True):
-                If True, offloads models to CPU during generation to save VRAM
         """
-        start_time = time.time()
+        Args:
+            input_data (str | dict): The input data for video generation. It can be a path to a json file.
+            video_save_path (str, optional): The path to save the generated video. Defaults to None.
+            motion_frame (int, optional): The number of motion frames. Defaults to 25.
+            frame_num (int, optional): The number of frames to generate. Defaults to 81.
+            shift (float, optional): The shift value for the timestep transform. Defaults to 5.0.
+            sample_steps (int, optional): The number of sampling steps. Defaults to 10.
+            text_guide_scale (float, optional): The text guide scale. Defaults to 1.0.
+            audio_guide_scale (float, optional): The audio guide scale. Defaults to 2.0.
+            n_prompt (str, optional): The negative prompt. Defaults to "".
+            seed (int, optional): The seed for the video generation. Defaults to 42.
+            max_frames_num (int, optional): The maximum number of frames to generate. Defaults to 1000.
+            face_scale (float, optional): The face scale. Defaults to 0.05.
+            progress (bool, optional): Whether to show the progress bar. Defaults to True.
+            color_correction_strength (float, optional): The color correction strength. Defaults to 0.0.
+            use_teacache (bool, optional): Whether to use teacache. Defaults to True.
+            teacache_thresh (float, optional): The teacache threshold. Defaults to 0.2.
+            use_apg (bool, optional): Whether to use APG. Defaults to False.
+            apg_momentum (float, optional): The APG momentum. Defaults to -0.75.
+            apg_norm_threshold (float, optional): The APG norm threshold. Defaults to 55.
+        """
+        generation_start_time = time.perf_counter()
+        seed_everything(seed if seed >= 0 else random.randint(0, 99999999))
         # init teacache
         if use_teacache:
             logger.info(
-                f"Initializing teacache with sample steps: {sampling_steps}, teacache threshold: {teacache_thresh}, model scale: {size_buckget}"
+                f"Initializing teacache with sample steps: {sample_steps}, teacache threshold: {teacache_thresh}"
             )
             self.model.teacache_init(
-                sample_steps=sampling_steps,
+                sample_steps=sample_steps,
                 teacache_thresh=teacache_thresh,
-                model_scale=size_buckget,
             )
             logger.info(f"Teacache initialized")
         else:
             self.model.disable_teacache()
 
-        input_data = self.audio_encoder.process_input_data(input_json_path)
+        input_data = self.audio_encoder.process_input_data(input_data)
         logger.info(f"Input prompt: {input_data['prompt']}")
 
         input_prompt = input_data["prompt"]
         cond_file_path = input_data["cond_image"]
         cond_image = Image.open(cond_file_path).convert("RGB")
 
-        # decide a proper size
-        if size_buckget == "multitalk-480":
-            bucket_config = ASPECT_RATIO_627
-        elif size_buckget == "multitalk-720":
-            bucket_config = ASPECT_RATIO_960
-
+        bucket_config = ASPECT_RATIO_627
         src_h, src_w = cond_image.height, cond_image.width
         ratio = src_h / src_w
         closest_bucket = sorted(
@@ -340,8 +348,8 @@ class MultiTalkPipeline:
             person1_audio_embedding = input_data["cond_audio"]["person1"]
             person2_audio_embedding = input_data["cond_audio"]["person2"]
             if (
-                person1_audio_embedding.shape[0] > frame_num
-                and person2_audio_embedding.shape[0] > frame_num
+                person1_audio_embedding.shape[0] <= frame_num
+                or person2_audio_embedding.shape[0] <= frame_num
             ):
                 raise ValueError(
                     f"Audio embedding length not satisfies frame nums: {person1_audio_embedding.shape[0]} > {frame_num} and {person2_audio_embedding.shape[0]} > {frame_num}"
@@ -362,11 +370,10 @@ class MultiTalkPipeline:
         context, context_null = self.text_encoder([input_prompt, n_prompt], self.device)
         t5_infer_time += time.perf_counter() - t5_infer_start
         logger.info(f"Text encoder inference time: {t5_infer_time} seconds")
-        if offload_model:
-            t5_io_start = time.perf_counter()
-            self.text_encoder.model.cpu()
-            t5_io_time += time.perf_counter() - t5_io_start
-            logger.info(f"Text encoder offload time: {t5_io_time} seconds")
+        t5_io_start = time.perf_counter()
+        self.text_encoder.model.cpu()
+        t5_io_time += time.perf_counter() - t5_io_start
+        logger.info(f"Text encoder offload time: {t5_io_time} seconds")
         torch_gc()
 
         # prepare params for video generation
@@ -379,14 +386,6 @@ class MultiTalkPipeline:
         audio_end_idx = audio_start_idx + clip_length
         gen_video_list = []
         torch_gc()
-
-        # set random seed and init noise
-        seed = seed if seed >= 0 else random.randint(0, 99999999)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        np.random.seed(seed)
-        random.seed(seed)
-        torch.backends.cudnn.deterministic = True
 
         # start video generation iteratively
         while True:
@@ -451,11 +450,10 @@ class MultiTalkPipeline:
                 )
                 clip_infer_time += time.perf_counter() - clip_infer_start
                 logger.info(f"Clip infer time: {clip_infer_time} seconds")
-                if offload_model:
-                    clip_io_start = time.perf_counter()
-                    self.clip.model.cpu()
-                    clip_io_time += time.perf_counter() - clip_io_start
-                    logger.info(f"Clip offload time: {clip_io_time} seconds")
+                clip_io_start = time.perf_counter()
+                self.clip.model.cpu()
+                clip_io_time += time.perf_counter() - clip_io_start
+                logger.info(f"Clip offload time: {clip_io_time} seconds")
                 torch_gc()
 
                 # zero padding and vae encode
@@ -553,7 +551,7 @@ class MultiTalkPipeline:
             with torch.no_grad(), no_sync():
                 # prepare timesteps
                 timesteps = list(
-                    np.linspace(self.num_timesteps, 1, sampling_steps, dtype=np.float32)
+                    np.linspace(self.num_timesteps, 1, sample_steps, dtype=np.float32)
                 )
                 timesteps.append(0.0)
                 timesteps = [torch.tensor([t], device=self.device) for t in timesteps]
@@ -731,9 +729,8 @@ class MultiTalkPipeline:
                     x0 = [latent.to(self.device)]
                     del latent_model_input, timestep
 
-                if offload_model:
-                    if not self.vram_management:
-                        self.model.cpu()
+                if not self.vram_management:
+                    self.model.cpu()
                 torch_gc()
                 vae_decode_time = 0
                 vae_decode_start = time.perf_counter()
@@ -795,10 +792,7 @@ class MultiTalkPipeline:
                 break
 
             torch_gc()
-            if offload_model:
-                torch.cuda.synchronize()
-            if dist.is_initialized():
-                dist.barrier()
+            torch.cuda.synchronize()
 
         gen_video_samples = torch.cat(gen_video_list, dim=2)[
             :, :, : int(max_frames_num)
@@ -808,14 +802,9 @@ class MultiTalkPipeline:
             # split video frames
             gen_video_samples = gen_video_samples[:, :, : -1 * miss_lengths[0]]
 
-        if dist.is_initialized():
-            dist.barrier()
-
         del noise, latent
         torch_gc()
 
-        end_time = time.time()
-        logger.info(f"Generation time: {end_time - start_time} seconds")
         if video_save_path is None:
             video_save_path = f"multitalk_video_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
         save_video_ffmpeg(
@@ -825,6 +814,11 @@ class MultiTalkPipeline:
             audio_sample_rate=self.audio_encoder.sample_rate,
         )
         logger.info(f"Video saved to {video_save_path}")
+
+        generation_end_time = time.perf_counter()
+        logger.info(
+            f"Generation time: {generation_end_time - generation_start_time} seconds"
+        )
         return video_save_path
 
 
