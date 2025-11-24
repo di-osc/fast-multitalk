@@ -258,13 +258,13 @@ class MultiTalkPipeline:
         seed: int = 42,
         max_frames_num: int = 1000,
         face_scale: float = 0.05,
-        progress: bool = True,
         color_correction_strength: float = 0.0,
         use_teacache: bool = True,
         teacache_thresh: float = 0.2,
         use_apg: bool = False,
         apg_momentum: float = -0.75,
         apg_norm_threshold: float = 55,
+        progress: bool = True,
         **kwargs: Any,
     ):
         """
@@ -281,13 +281,13 @@ class MultiTalkPipeline:
             seed (int, optional): The seed for the video generation. Defaults to 42.
             max_frames_num (int, optional): The maximum number of frames to generate. Defaults to 1000.
             face_scale (float, optional): The face scale. Defaults to 0.05.
-            progress (bool, optional): Whether to show the progress bar. Defaults to True.
             color_correction_strength (float, optional): The color correction strength. Defaults to 0.0.
             use_teacache (bool, optional): Whether to use teacache. Defaults to True.
             teacache_thresh (float, optional): The teacache threshold. Defaults to 0.2.
             use_apg (bool, optional): Whether to use APG. Defaults to False.
             apg_momentum (float, optional): The APG momentum. Defaults to -0.75.
             apg_norm_threshold (float, optional): The APG norm threshold. Defaults to 55.
+            progress (bool, optional): Whether to show the progress bar. Defaults to True.
         """
         generation_start_time = time.perf_counter()
         seed_everything(seed if seed >= 0 else random.randint(0, 99999999))
@@ -300,7 +300,7 @@ class MultiTalkPipeline:
                 sample_steps=sample_steps,
                 teacache_thresh=teacache_thresh,
             )
-            logger.info(f"Teacache initialized")
+            logger.info("Teacache initialized")
         else:
             self.model.disable_teacache()
 

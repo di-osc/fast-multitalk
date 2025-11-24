@@ -41,13 +41,13 @@ def save_video_ffmpeg(
             save_video(video_audio, save_path_tmp, fps=fps, quality=quality)
 
         # random name for audio
-        audio_save_path = Path(temp_dir) / f"audio-temp.wav"
+        audio_save_path = Path(temp_dir) / "audio-temp.wav"
         save_audio(audio_samples, audio_save_path, audio_sample_rate)
 
         # crop audio according to video length
         _, T, _, _ = gen_video_samples.shape
         duration = T / fps
-        save_path_crop_audio = Path(temp_dir) / f"audio-crop-temp.wav"
+        save_path_crop_audio = Path(temp_dir) / "audio-crop-temp.wav"
         final_command = [
             "ffmpeg",
             "-i",

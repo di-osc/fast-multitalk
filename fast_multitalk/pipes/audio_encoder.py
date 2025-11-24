@@ -1,4 +1,3 @@
-from einops import rearrange
 import os
 import subprocess
 from typing import Literal
@@ -9,6 +8,7 @@ from transformers import Wav2Vec2FeatureExtractor
 import numpy as np
 import torch
 import pyloudnorm as pyln
+from einops import rearrange
 
 from ..models.wav2vec import Wav2Vec2Model
 

@@ -1,18 +1,13 @@
 import math
-import json
-import os
 import html
 import string
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from safetensors.torch import load_file
-from optimum.quanto import requantize
 import ftfy
 import regex as re
 from transformers import AutoTokenizer
-from loguru import logger
 
 
 def basic_clean(text):
