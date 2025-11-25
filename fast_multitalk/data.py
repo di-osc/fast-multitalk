@@ -8,8 +8,7 @@ import imageio
 from tqdm import tqdm
 import numpy as np
 import soundfile as sf
-
-from .utils import cache_video
+from loguru import logger
 
 
 def save_video_ffmpeg(
@@ -19,36 +18,40 @@ def save_video_ffmpeg(
     audio_sample_rate: int = 16000,
     fps: int = 25,
     quality: int = 9,
-    high_quality_save: bool = False,
+    encoders: list[str] = ["libx264", "libopenh264"],
 ):
+    """使用ffmpeg命令保存视频和音频到指定路径,视频保存为mp4格式,音频保存为wav格式,并使用指定的编码器进行编码.
+
+    Args:
+        save_path (str): 保存路径
+        gen_video_samples (torch.Tensor): 视频样本
+        audio_samples (np.ndarray): 音频样本
+        audio_sample_rate (int, optional): 音频采样率. Defaults to 16000.
+        fps (int, optional): 视频帧率. Defaults to 25.
+        quality (int, optional): 视频质量. Defaults to 9.
+        encoders (list[str], optional): 视频编码器. Defaults to ["libopenh264", "libx264"]. 可选择多个编码器,先尝试第一个,如果失败则尝试第二个.
+    """
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as temp_dir:
         save_path_tmp = Path(temp_dir) / "video-temp.mp4"
-        if high_quality_save:
-            cache_video(
-                tensor=gen_video_samples.unsqueeze(0),
-                save_file=save_path_tmp,
-                fps=fps,
-                nrow=1,
-                normalize=True,
-                value_range=(-1, 1),
-            )
-        else:
-            video_audio = (gen_video_samples + 1) / 2  # C T H W
-            video_audio = video_audio.permute(1, 2, 3, 0).cpu().numpy()
-            video_audio = np.clip(video_audio * 255, 0, 255).astype(
-                np.uint8
-            )  # to [0, 255]
-            save_video(video_audio, save_path_tmp, fps=fps, quality=quality)
+        logger.info(f"Saving video to {save_path_tmp}")
+        video_audio = (gen_video_samples + 1) / 2  # C T H W
+        video_audio = video_audio.permute(1, 2, 3, 0).cpu().numpy()
+        video_audio = np.clip(video_audio * 255, 0, 255).astype(np.uint8)  # to [0, 255]
+        save_video(video_audio, save_path_tmp, fps=fps, quality=quality)
 
         # random name for audio
         audio_save_path = Path(temp_dir) / "audio-temp.wav"
+        logger.info(f"Saving audio to {audio_save_path}")
         save_audio(audio_samples, audio_save_path, audio_sample_rate)
 
         # crop audio according to video length
         _, T, _, _ = gen_video_samples.shape
         duration = T / fps
-        save_path_crop_audio = Path(temp_dir) / "audio-crop-temp.wav"
-        final_command = [
+        save_path_crop_audio = Path(temp_dir) / f"audio-crop-temp-{duration}.wav"
+        logger.info(f"Cropping audio to {save_path_crop_audio}")
+        crop_audio_command = [
             "ffmpeg",
             "-i",
             audio_save_path,
@@ -57,58 +60,47 @@ def save_video_ffmpeg(
             save_path_crop_audio,
         ]
         subprocess.run(
-            final_command,
+            crop_audio_command,
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-
-        if high_quality_save:
-            final_command = [
+        result = None
+        for encoder in encoders:
+            logger.info(f"Merging video and audio with encoder: {encoder}")
+            merge_video_audio_command = [
                 "ffmpeg",
                 "-y",
                 "-i",
-                save_path_tmp,
+                str(save_path_tmp),
                 "-i",
-                save_path_crop_audio,
+                str(save_path_crop_audio),
                 "-c:v",
-                "libopenh264",
-                "-crf",
-                "0",
-                "-preset",
-                "veryslow",
+                encoder,
                 "-c:a",
                 "aac",
                 "-shortest",
-                save_path,
+                "-movflags",
+                "+faststart",
+                str(save_path),
             ]
-            subprocess.run(
-                final_command,
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        else:
-            final_command = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                save_path_tmp,
-                "-i",
-                save_path_crop_audio,
-                "-c:v",
-                "libopenh264",
-                "-c:a",
-                "aac",
-                "-shortest",
-                save_path,
-            ]
-            subprocess.run(
-                final_command,
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            # 合并视频和音频
+            try:
+                result = subprocess.run(
+                    merge_video_audio_command, stderr=subprocess.PIPE, check=True
+                )
+                logger.info(
+                    f"Successfully merged video and audio with encoder {encoder}"
+                )
+                break
+            except subprocess.CalledProcessError as e:
+                logger.warning(
+                    f"Failed to merge video and audio with encoder {encoder}: {e.stderr.decode('utf-8')}"
+                )
+                continue
+        if result is None or result.returncode != 0:
+            logger.error("Failed to merge video and audio with any encoder")
+            raise RuntimeError("Failed to merge video and audio")
         os.remove(save_path_tmp)
         os.remove(save_path_crop_audio)
         os.remove(audio_save_path)

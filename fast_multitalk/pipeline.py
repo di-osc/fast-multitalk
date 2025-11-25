@@ -264,13 +264,14 @@ class MultiTalkPipeline:
         use_apg: bool = False,
         apg_momentum: float = -0.75,
         apg_norm_threshold: float = 55,
-        progress: bool = True,
+        progress: bool = False,
         **kwargs: Any,
     ):
         """
         Args:
             input_data (str | dict): The input data for video generation. It can be a path to a json file.
             video_save_path (str, optional): The path to save the generated video. Defaults to None.
+            merge_video_audio (bool, optional): Whether to merge video and audio. Defaults to True.
             motion_frame (int, optional): The number of motion frames. Defaults to 25.
             frame_num (int, optional): The number of frames to generate. Defaults to 81.
             shift (float, optional): The shift value for the timestep transform. Defaults to 5.0.
@@ -305,8 +306,6 @@ class MultiTalkPipeline:
             self.model.disable_teacache()
 
         input_data = self.audio_encoder.process_input_data(input_data)
-        logger.info(f"Input prompt: {input_data['prompt']}")
-
         input_prompt = input_data["prompt"]
         cond_file_path = input_data["cond_image"]
         cond_image = Image.open(cond_file_path).convert("RGB")
@@ -489,9 +488,9 @@ class MultiTalkPipeline:
                 human_masks = [human_mask1, human_mask2, background_mask]
             elif HUMAN_NUMBER == 2:
                 if "bbox" in input_data:
-                    assert len(input_data["bbox"]) == len(input_data["cond_audio"]), (
-                        "The number of target bbox should be the same with cond_audio"
-                    )
+                    assert len(input_data["bbox"]) == len(
+                        input_data["cond_audio"]
+                    ), "The number of target bbox should be the same with cond_audio"
                     background_mask = torch.zeros([src_h, src_w])
                     for _, person_bbox in input_data["bbox"].items():
                         x_min, y_min, x_max, y_max = person_bbox
@@ -635,6 +634,8 @@ class MultiTalkPipeline:
                     else (lambda x: x)
                 )
                 for i in progress_wrap(range(len(timesteps) - 1)):
+                    logger.info(f"Dit step {i} start")
+                    dit_step_start_time = time.perf_counter()
                     timestep = timesteps[i]
                     latent_model_input = [latent.to(self.device)]
 
@@ -658,6 +659,10 @@ class MultiTalkPipeline:
                             latent_model_input, t=timestep, **arg_null
                         )[0]
                         torch_gc()
+                    dit_step_end_time = time.perf_counter()
+                    logger.info(
+                        f"Dit step {i} end, time: {dit_step_end_time - dit_step_start_time} seconds"
+                    )
 
                     if use_apg:
                         # correct update direction
@@ -804,7 +809,7 @@ class MultiTalkPipeline:
 
         del noise, latent
         torch_gc()
-
+        
         if video_save_path is None:
             video_save_path = f"multitalk_video_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
         save_video_ffmpeg(

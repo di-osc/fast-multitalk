@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from einops import rearrange
-import xformers.ops
+from flash_attn import flash_attn_func
 
 from .rope import RotaryPositionalEmbedding1D
 from .utils import normalize_and_scale
@@ -77,15 +77,7 @@ class SingleStreamAttention(nn.Module):
         q = rearrange(q, "B H M K -> B M H K")
         encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
         encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
-
-        attn_bias = None
-        x = xformers.ops.memory_efficient_attention(
-            q,
-            encoder_k,
-            encoder_v,
-            attn_bias=attn_bias,
-            op=None,
-        )
+        x = flash_attn_func(q, encoder_k, encoder_v)
         x = rearrange(x, "B M H K -> B H M K")
 
         # linear transform
@@ -214,13 +206,7 @@ class SingleStreamMutiAttention(SingleStreamAttention):
         q = rearrange(q, "B H M K -> B M H K")
         encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
         encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
-        x = xformers.ops.memory_efficient_attention(
-            q,
-            encoder_k,
-            encoder_v,
-            attn_bias=None,
-            op=None,
-        )
+        x = flash_attn_func(q, encoder_k, encoder_v)
         x = rearrange(x, "B M H K -> B H M K")
 
         # linear transform

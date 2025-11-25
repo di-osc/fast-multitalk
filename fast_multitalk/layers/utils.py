@@ -1,8 +1,4 @@
 import torch
-
-from xfuser.core.distributed import (
-    get_sp_group,
-)
 import numpy as np
 from skimage import color
 
@@ -95,10 +91,7 @@ def get_attn_map_with_target(
     ref_target_masks: [B, N_h * N_w]
     """
 
-    N_t, N_h, N_w = shape
-    if enable_sp:
-        ref_k = get_sp_group().all_gather(ref_k, dim=1)
-
+    _, N_h, N_w = shape
     x_seqlens = N_h * N_w
     ref_k = ref_k[:, :x_seqlens]
     _, seq_lens, heads, _ = visual_q.shape
