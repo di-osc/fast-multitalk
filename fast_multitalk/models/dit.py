@@ -1,5 +1,5 @@
 import math
-import os
+from typing import Tuple, List, Optional, Literal
 
 import numpy as np
 import torch
@@ -7,20 +7,15 @@ import torch.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-
-from diffusers import ModelMixin
-from diffusers.configuration_utils import ConfigMixin, register_to_config
 from loguru import logger
-from safetensors import safe_open
-from functools import lru_cache
-from tqdm import tqdm
 
-from ..ops.attn import flash_attention
+from ..ops.attn import attention_varlen
 from ..layers.attention import SingleStreamMutiAttention
 from ..layers.utils import get_attn_map_with_target
+from ..utils import load_state_dict, to_param_dtype
 
 
-def sinusoidal_embedding_1d(dim, position):
+def sinusoidal_embedding_1d(dim, position) -> torch.Tensor:
     # preprocess
     assert dim % 2 == 0
     half = dim // 2
@@ -35,7 +30,7 @@ def sinusoidal_embedding_1d(dim, position):
 
 
 @amp.autocast(enabled=False, device_type="cuda")
-def rope_params(max_seq_len, dim, theta=10000):
+def rope_params(max_seq_len, dim, theta=10000) -> torch.Tensor:
     assert dim % 2 == 0
     freqs = torch.outer(
         torch.arange(max_seq_len),
@@ -45,8 +40,9 @@ def rope_params(max_seq_len, dim, theta=10000):
     return freqs
 
 
-@amp.autocast(enabled=False, device_type="cuda")
-def rope_apply(x, grid_sizes, freqs):
+def rope_apply(
+    x: torch.Tensor, grid_sizes: torch.Tensor, freqs: torch.Tensor
+) -> torch.Tensor:
     s, n, c = x.size(1), x.size(2), x.size(3) // 2
 
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
@@ -73,20 +69,21 @@ def rope_apply(x, grid_sizes, freqs):
 
 
 class WanRMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-5):
+    def __init__(self, dim, eps=1e-5) -> None:
         super().__init__()
         self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def forward(self, x):
+    @torch.compile()
+    def forward(self, x) -> torch.Tensor:
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
         """
         return self._norm(x.float()).type_as(x) * self.weight
 
-    def _norm(self, x):
+    def _norm(self, x) -> torch.Tensor:
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
 
@@ -140,7 +137,7 @@ class WanSelfAttention(nn.Module):
         q = rope_apply(q, grid_sizes, freqs)
         k = rope_apply(k, grid_sizes, freqs)
 
-        x = flash_attention(
+        x = attention_varlen(
             q=q, k=k, v=v, k_lens=seq_lens, window_size=self.window_size
         ).type_as(x)
 
@@ -177,9 +174,9 @@ class WanI2VCrossAttention(WanSelfAttention):
         v = self.v(context).view(b, -1, n, d)
         k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
         v_img = self.v_img(context_img).view(b, -1, n, d)
-        img_x = flash_attention(q, k_img, v_img, k_lens=None)
+        img_x = attention_varlen(q, k_img, v_img, k_lens=None)
         # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        x = attention_varlen(q, k, v, k_lens=context_lens)
 
         # output
         x = x.flatten(2)
@@ -351,7 +348,7 @@ class MLPProj(nn.Module):
         return clip_extra_context_tokens
 
 
-class AudioProjModel(ModelMixin, ConfigMixin):
+class AudioProjModel(nn.Module):
     def __init__(
         self,
         seq_len=5,
@@ -422,52 +419,37 @@ class AudioProjModel(ModelMixin, ConfigMixin):
         return context_tokens
 
 
-class WanModel(ModelMixin, ConfigMixin):
-    r"""
-    Wan diffusion backbone supporting both text-to-video and image-to-video.
-    """
-
-    ignore_for_config = [
-        "patch_size",
-        "cross_attn_norm",
-        "qk_norm",
-        "text_dim",
-        "window_size",
-    ]
-    _no_split_modules = ["WanAttentionBlock"]
-
-    @register_to_config
+class WanModel(nn.Module):
     def __init__(
         self,
-        model_type="i2v",
-        patch_size=(1, 2, 2),
-        text_len=512,
-        in_dim=16,
-        dim=2048,
-        ffn_dim=8192,
-        freq_dim=256,
-        text_dim=4096,
-        out_dim=16,
-        num_heads=16,
-        num_layers=32,
-        window_size=(-1, -1),
-        qk_norm=True,
-        cross_attn_norm=True,
-        eps=1e-6,
+        patch_size: Tuple[int, int, int] = (1, 2, 2),
+        text_len: int = 512,
+        in_dim: int = 36,
+        dim: int = 5120,
+        ffn_dim: int = 13824,
+        freq_dim: int = 256,
+        text_dim: int = 4096,
+        out_dim: int = 16,
+        num_heads: int = 40,
+        num_layers: int = 40,
+        window_size: Tuple[int, int] = (-1, -1),
+        qk_norm: bool = True,
+        cross_attn_norm: bool = True,
+        eps: float = 1e-6,
         # audio params
-        audio_window=5,
-        intermediate_dim=512,
-        output_dim=768,
-        context_tokens=32,
-        vae_scale=4,  # vae timedownsample scale
-        norm_input_visual=True,
-        norm_output_audio=True,
-        weight_init=True,
+        audio_window: int = 5,
+        intermediate_dim: int = 512,
+        output_dim: int = 768,
+        context_tokens: int = 32,
+        vae_scale: int = 4,  # vae timedownsample scale
+        norm_input_visual: bool = True,
+        norm_output_audio: bool = True,
+        weight_init: bool = False,
+        **kwargs,
     ):
         super().__init__()
 
-        assert model_type == "i2v", "MultiTalk model requires your model_type is i2v."
-        self.model_type = model_type
+        self.model_type = "i2v"
 
         self.patch_size = patch_size
         self.text_len = text_len
@@ -535,11 +517,7 @@ class WanModel(ModelMixin, ConfigMixin):
             ],
             dim=1,
         )
-
-        if model_type == "i2v":
-            self.img_emb = MLPProj(1280, dim)
-        else:
-            raise NotImplementedError("Not supported model type.")
+        self.img_emb = MLPProj(1280, dim)
 
         # init audio adapter
         self.audio_proj = AudioProjModel(
@@ -555,6 +533,8 @@ class WanModel(ModelMixin, ConfigMixin):
         if weight_init:
             self.init_weights()
 
+        self.enable_teacache = False
+
     def init_freqs(self):
         d = self.dim // self.num_heads
         self.freqs = torch.cat(
@@ -564,7 +544,7 @@ class WanModel(ModelMixin, ConfigMixin):
                 rope_params(1024, 2 * (d // 6)),
             ],
             dim=1,
-        )
+        ).to("cuda")
 
     def teacache_init(
         self,
@@ -626,19 +606,16 @@ class WanModel(ModelMixin, ConfigMixin):
             self.__class__.ret_steps = 1 * 3
             self.__class__.cutoff_steps = sample_steps * 3 - 3
 
-    def disable_teacache(self):
-        self.enable_teacache = False
-
     def forward(
         self,
-        x,
-        t,
-        context,
-        seq_len,
-        clip_fea=None,
-        y=None,
-        audio=None,
-        ref_target_masks=None,
+        x: List[torch.Tensor],
+        t: torch.Tensor,
+        context: List[torch.Tensor],
+        seq_len: int,
+        clip_fea: Optional[torch.Tensor] = None,
+        y: Optional[torch.Tensor] = None,
+        audio: Optional[torch.Tensor] = None,
+        ref_target_masks: Optional[torch.Tensor] = None,
     ):
         assert clip_fea is not None and y is not None
 
@@ -909,110 +886,66 @@ class WanModel(ModelMixin, ConfigMixin):
         # init output layer
         nn.init.zeros_(self.head.head.weight)
 
+    def get_example_input(self, device: str = "cpu"):
+        x = [torch.randn(16, 18, 104, 56, dtype=torch.float32, device=device)]
+        t = torch.tensor([1], dtype=torch.float32, device=device)
+        context = [torch.randn(138, 4096, dtype=torch.bfloat16, device=device)]
+        clip_fea = torch.randn(1, 257, 1280, dtype=torch.bfloat16, device=device)
+        seq_len = 26208
+        y = torch.randn(1, 20, 18, 104, 56, dtype=torch.bfloat16, device=device)
+        audio = torch.randn(1, 69, 5, 12, 768, dtype=torch.bfloat16, device=device)
+        ref_target_masks = torch.randn(3, 104, 5, dtype=torch.float32, device=device)
+        example_inputs = {}
+        example_inputs["x"] = x
+        example_inputs["t"] = t
+        example_inputs["context"] = context
+        example_inputs["clip_fea"] = clip_fea
+        example_inputs["seq_len"] = seq_len
+        example_inputs["y"] = y
+        example_inputs["audio"] = audio
+        example_inputs["ref_target_masks"] = ref_target_masks
+        return example_inputs
 
-@lru_cache(maxsize=None)
-def GET_DTYPE():
-    RUNNING_FLAG = os.getenv("DTYPE")
-    return RUNNING_FLAG
+
+def load_wan_multitalk_model(
+    wan_path: str,
+    multitalk_path: str,
+    param_dtype: torch.dtype = torch.bfloat16,
+    **kwargs,
+) -> WanModel:
+    logger.info(
+        f"Loading Wan model from {wan_path} and multitalk model from {multitalk_path}"
+    )
+    states = load_state_dict(wan_path)
+    multitalk_states = load_state_dict(multitalk_path)
+    for key in multitalk_states:
+        states[key] = multitalk_states[key]
+    with torch.device("meta"):
+        wan_model = WanModel(**kwargs)
+    wan_model.load_state_dict(states, assign=True)
+    wan_model.init_freqs()
+    wan_model.eval().requires_grad_(False)
+    to_param_dtype(wan_model, param_dtype)
+    return wan_model
 
 
-class WanLoraWrapper:
-    def __init__(self, wan_model):
-        self.model = wan_model
-        self.lora_metadata = {}
-        # self.override_dict = {}  # On CPU
+def load_quant_wan_multitalk_model(
+    quant_dir: str,
+    quant: str = "int8",
+    distill: Literal["lightx2v", "fusionx"] = "fusionx",
+    **kwargs,
+):
+    from optimum.quanto import requantize
+    from pathlib import Path
+    import json
 
-    def load_lora(self, lora_path, lora_name=None):
-        if lora_name is None:
-            lora_name = os.path.basename(lora_path).split(".")[0]
-
-        if lora_name in self.lora_metadata:
-            logger.info(f"LoRA {lora_name} already loaded, skipping...")
-            return lora_name
-
-        self.lora_metadata[lora_name] = {"path": lora_path}
-        logger.info(f"Registered LoRA metadata for: {lora_name} from {lora_path}")
-
-        return lora_name
-
-    def _load_lora_file(self, file_path, param_dtype):
-        with safe_open(file_path, framework="pt") as f:
-            tensor_dict = {key: f.get_tensor(key).to(param_dtype) for key in f.keys()}
-        return tensor_dict
-
-    def apply_lora(
-        self, lora_name, alpha=1.0, param_dtype=torch.bfloat16, device="cpu"
-    ):
-        if lora_name not in self.lora_metadata:
-            logger.info(f"LoRA {lora_name} not found. Please load it first.")
-
-        lora_weights = self._load_lora_file(
-            self.lora_metadata[lora_name]["path"], param_dtype
-        )
-        # weight_dict = self.model.original_weight_dict
-        self._apply_lora_weights(lora_weights, alpha, device)
-        # self.model._init_weights(weight_dict)
-
-        logger.info(f"Applied LoRA: {lora_name} with alpha={alpha}")
-        return True
-
-    def get_parameter_by_name(self, model, param_name):
-        parts = param_name.split(".")
-        current = model
-        for part in parts:
-            if part.isdigit():
-                current = current[int(part)]
-            else:
-                current = getattr(current, part)
-        return current
-
-    @torch.no_grad()
-    def _apply_lora_weights(self, lora_weights, alpha, device):
-        lora_pairs = {}
-        prefix = "diffusion_model."
-
-        for key in lora_weights.keys():
-            if key.endswith("lora_down.weight") and key.startswith(prefix):
-                base_name = key[len(prefix) :].replace("lora_down.weight", "weight")
-                b_key = key.replace("lora_down.weight", "lora_up.weight")
-                if b_key in lora_weights:
-                    lora_pairs[base_name] = (key, b_key)
-            elif key.endswith("diff_b") and key.startswith(prefix):
-                base_name = key[len(prefix) :].replace("diff_b", "bias")
-                lora_pairs[base_name] = key
-            elif key.endswith("diff") and key.startswith(prefix):
-                base_name = key[len(prefix) :].replace("diff", "weight")
-                lora_pairs[base_name] = key
-
-        applied_count = 0
-        for name in tqdm(lora_pairs.keys(), desc="Loading LoRA weights"):
-            param = self.get_parameter_by_name(self.model, name)
-            if device == "cpu":
-                dtype = torch.float32
-            else:
-                dtype = param.dtype
-            if isinstance(lora_pairs[name], tuple):
-                name_lora_A, name_lora_B = lora_pairs[name]
-                lora_A = lora_weights[name_lora_A].to(device, dtype)
-                lora_B = lora_weights[name_lora_B].to(device, dtype)
-                delta = torch.matmul(lora_B, lora_A) * alpha
-                delta = delta.to(param.device, param.dtype)
-                param.add_(delta)
-            else:
-                name_lora = lora_pairs[name]
-                delta = lora_weights[name_lora].to(param.device, dtype) * alpha
-                delta = delta.to(param.device, param.dtype)
-                param.add_(delta)
-            applied_count += 1
-
-        logger.info(f"Applied {applied_count} LoRA weight adjustments")
-        if applied_count == 0:
-            logger.info(
-                "Warning: No LoRA weights were applied. Expected naming conventions: 'diffusion_model.<layer_name>.lora_A.weight' and 'diffusion_model.<layer_name>.lora_B.weight'. Please verify the LoRA weight file."
-            )
-
-    def list_loaded_loras(self):
-        return list(self.lora_metadata.keys())
-
-    def get_current_lora(self):
-        return self.model.current_lora
+    with torch.device("meta"):
+        wan_model = WanModel(**kwargs)
+    model_path = Path(quant_dir) / f"quant_model_{quant}_{distill}.safetensors"
+    states = load_state_dict(model_path)
+    map_path = Path(quant_dir) / f"quant_map_{quant}_{distill}.json"
+    with open(map_path, "r") as f:
+        map_dict = json.load(f)
+    requantize(wan_model, states, map, device="cpu")
+    wan_model.eval().requires_grad_(False)
+    return wan_model

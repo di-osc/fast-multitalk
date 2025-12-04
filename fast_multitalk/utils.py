@@ -5,8 +5,7 @@ import os.path as osp
 import binascii
 import os
 import random
-import requests
-import uuid
+from pathlib import Path
 
 import torch
 import torchvision
@@ -15,7 +14,6 @@ import numpy as np
 import torch.nn as nn
 import torchvision.transforms as transforms
 from PIL import Image
-from loguru import logger
 
 
 @contextmanager
@@ -89,14 +87,12 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
 
 
-def to_param_dtype_fp32only(model, param_dtype):
+def to_param_dtype(model: torch.nn.Module, param_dtype: torch.dtype):
     for module in model.modules():
         for name, param in module.named_parameters(recurse=False):
-            if param.dtype == torch.float32:
-                param.data = param.data.to(param_dtype)
+            param.data = param.data.to(param_dtype)
         for name, buf in module.named_buffers(recurse=False):
-            if buf.dtype == torch.float32:
-                module._buffers[name] = buf.to(param_dtype)
+            module._buffers[name] = buf.to(param_dtype)
 
 
 def resize_and_centercrop(cond_image, target_size):
@@ -264,37 +260,13 @@ def str2bool(v):
         raise argparse.ArgumentTypeError("Boolean value expected (True/False)")
 
 
-def download_file(url: str, work_dir: str, filename: str = str(uuid.uuid4())) -> str:
-    local_filename = filename
-    try:
-        local_filename = f"{work_dir}/{local_filename}"
-        logger.info(f"输入文件：{url}，下载到本地文件：{local_filename}")
-        with requests.get(url, stream=True, timeout=30000) as response:
-            response.raise_for_status()  # 检查请求是否成功（状态码200）
-            # 获取文件总大小（用于进度显示）
-            total_size = int(response.headers.get("content-length", 0))
-            # 以二进制写模式打开本地文件
-            with open(local_filename, "wb") as file:
-                downloaded = 0
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:  # 过滤掉保持连接的空chunk
-                        file.write(chunk)
-                        downloaded += len(chunk)
-                        # 可选：显示下载进度
-                        if total_size > 0:
-                            percent = (downloaded / total_size) * 100
-                            print(
-                                f"\r下载进度: {percent:.1f}% ({downloaded}/{total_size} bytes)",
-                                end="",
-                                flush=True,
-                            )
+def load_state_dict(file_path: str, device: str = "cpu") -> dict:
+    file_path = Path(file_path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+    if file_path.suffix == ".safetensors":
+        from safetensors.torch import load_file
 
-            logger.info(f"\n文件已成功下载并保存为: {local_filename}")
-            return local_filename
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"下载失败: {str(e)}")
-        return None
-    except Exception as e:
-        logger.error(f"保存文件时出错: {str(e)}")
-        return None
+        return load_file(file_path, device=device)
+    else:
+        return torch.load(file_path, map_location=device, weights_only=True)

@@ -37,8 +37,26 @@ class MultiTalkConfig:
     qk_norm = True
     cross_attn_norm = True
     eps = 1e-6
+    out_dim = 16
+    text_len = 512
 
     # inference
     num_train_timesteps = 1000
     sample_fps = 16
     sample_neg_prompt = "bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
+
+
+@dataclass
+class DiTConfig:
+    patch_size = (1, 2, 2)
+    dim = 5120
+    ffn_dim = 13824
+    freq_dim = 256
+    num_heads = 40
+    num_layers = 40
+    window_size = (-1, -1)
+    qk_norm = True
+    cross_attn_norm = True
+    eps = 1e-6
+    out_dim = 16
+    text_len = 512

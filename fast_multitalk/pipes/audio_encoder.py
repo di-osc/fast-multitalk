@@ -54,7 +54,7 @@ class AudioEncoder:
         audio_emb = rearrange(audio_emb, "b s d -> s b d")
 
         audio_emb = audio_emb.cpu().detach()
-        return audio_emb
+        return audio_emb, audio_duration
 
     def process_input_data(self, input_data: str | dict) -> dict:
         if isinstance(input_data, str):
@@ -69,17 +69,24 @@ class AudioEncoder:
                     sample_rate=self.sample_rate,
                 )
             )
-            audio_embedding_1 = self.get_embedding(new_human_speech1)
-            audio_embedding_2 = self.get_embedding(new_human_speech2)
+            audio_embedding_1, person1_audio_duration = self.get_embedding(
+                new_human_speech1
+            )
+            audio_embedding_2, person2_audio_duration = self.get_embedding(
+                new_human_speech2
+            )
             input_data["cond_audio"]["person1"] = audio_embedding_1
+            input_data["person1_audio_duration"] = person1_audio_duration
             input_data["cond_audio"]["person2"] = audio_embedding_2
+            input_data["person2_audio_duration"] = person2_audio_duration
             input_data["video_audio"] = sum_human_speechs
         elif len(input_data["cond_audio"]) == 1:
             human_speech = audio_prepare_single(
                 input_data["cond_audio"]["person1"], sample_rate=self.sample_rate
             )
-            audio_embedding = self.get_embedding(human_speech)
+            audio_embedding, audio_duration = self.get_embedding(human_speech)
             input_data["cond_audio"]["person1"] = audio_embedding
+            input_data["person1_audio_duration"] = audio_duration
             input_data["video_audio"] = human_speech
         return input_data
 

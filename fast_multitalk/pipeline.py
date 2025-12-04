@@ -1,25 +1,24 @@
-import json
 import math
 import random
 import time
-from contextlib import contextmanager
 from functools import partial
 from PIL import Image
-from typing import Literal, Any
+from typing import Literal, Any, List
 from pathlib import Path
+import gc
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+import torch.profiler
+from torch.profiler import profile, ProfilerActivity
 from tqdm import tqdm
-from safetensors.torch import load_file
-from optimum.quanto import requantize
 import optimum.quanto.nn.qlinear as qlinear
 from loguru import logger
 
 from .models.clip import CLIPModel
-from .models.dit import WanModel, WanLayerNorm, WanRMSNorm
+from .models.dit import WanLayerNorm, WanRMSNorm, load_wan_multitalk_model
 from .models.vae import WanVAE
 from .layers.utils import (
     MomentumBuffer,
@@ -38,11 +37,14 @@ from .config import MultiTalkConfig
 from .utils import (
     torch_gc,
     resize_and_centercrop,
-    to_param_dtype_fp32only,
     timestep_transform,
     seed_everything,
 )
 from .data import save_video_ffmpeg
+from .quantize import quantize_model
+
+
+torch.set_float32_matmul_precision("high")
 
 
 class MultiTalkPipeline:
@@ -51,13 +53,13 @@ class MultiTalkPipeline:
         base_dir: str,
         config: MultiTalkConfig = MultiTalkConfig(),
         device_id: int = 0,
-        init_on_cpu: bool = True,
         num_timesteps=1000,
         use_timestep_transform: bool = True,
-        quant: Literal["int8", "fp8"] | None = "int8",
-        distill_model: Literal["lightx2v", "FusionX"] = "lightx2v",
+        quant: Literal["int8wo", "fp6_e3m2", "qint8"] = "fp6_e3m2",
+        distill_model: Literal["lightx2v", "fusionx"] = "fusionx",
         low_vram_mode: bool = True,
-        num_persistent_param_in_dit: int = 10_000_000_000,
+        num_persistent_param_in_dit: int = 12_000_000_000,
+        cache_contexts: List[str] = [],
     ):
         """
         Initializes the image-to-video generation model components.
@@ -71,27 +73,48 @@ class MultiTalkPipeline:
         self.config = config
         self.param_dtype = config.param_dtype
 
-        audio_encoder_dir = str(Path(base_dir) / config.wav2vec_model)
-        self.audio_encoder = AudioEncoder(
-            checkpoint_dir=audio_encoder_dir, device=self.device
-        )
-
-        t5_path = Path(base_dir) / config.t5_checkpoint
+        self.sample_neg_prompt = config.sample_neg_prompt
+        cache_contexts.append(self.sample_neg_prompt)
         t5_tokenizer_path = Path(base_dir) / config.t5_tokenizer
         self.text_encoder = TextEncoder(
             text_len=config.text_len,
             dtype=config.t5_dtype,
-            device=torch.device("cpu"),
-            checkpoint_path=t5_path,
             tokenizer_path=str(t5_tokenizer_path),
-            shard_fn=None,
-            quant=quant,
             quant_dir=self.quant_dir,
+            cache_contexts=cache_contexts,
+        )
+
+        # dit model
+        model_path = self.base_dir / "wan_models" / f"wan21_{distill_model}.safetensors"
+        self.model = load_wan_multitalk_model(
+            wan_path=model_path,
+            multitalk_path=self.base_dir / "multitalk_bf16.safetensors",
+            dtype=self.param_dtype,
+        )
+        if quant is not None:
+            quantize_model(
+                model=self.model,
+                quant=quant,
+                exclude=[
+                    "time_embedding.0",
+                    "time_embedding.2",
+                    "time_projection.1",
+                    "head.head",
+                    "img_emb.proj.1",
+                    "img_emb.proj.3",
+                ],
+                device=self.device,
+            )
+            self.model.cpu()
+
+        audio_encoder_dir = str(Path(base_dir) / config.wav2vec_model)
+        self.audio_encoder = AudioEncoder(
+            checkpoint_dir=audio_encoder_dir, device="cpu"
         )
 
         self.clip = CLIPModel(
             dtype=config.clip_dtype,
-            device=self.device,
+            device="cpu",
             checkpoint_path=str(Path(base_dir) / config.clip_checkpoint),
             tokenizer_path=str(Path(base_dir) / config.clip_tokenizer),
         )
@@ -104,41 +127,8 @@ class MultiTalkPipeline:
             device=self.device,
         )
 
-        # init dit model
-        with torch.device("meta"):
-            wan_config = json.load(open(Path(base_dir) / "config.json"))
-            self.model = WanModel(weight_init=False, **wan_config)
-            torch_gc()
-
-        # load quantized distill model
-        logger.info(
-            f"Loading {distill_model} distilled model with {quant} quantization from {self.quant_dir}"
-        )
-        distill_model_path = (
-            self.quant_dir / f"quant_model_{quant}_{distill_model}.safetensors"
-        )
-        distill_model_state_dict = load_file(distill_model_path)
-        map_json_path = (
-            self.quant_dir / f"quantization_map_{quant}_{distill_model}.json"
-        )
-        with open(map_json_path, "r") as f:
-            distill_model_quantization_map = json.load(f)
-        requantize(
-            self.model,
-            distill_model_state_dict,
-            distill_model_quantization_map,
-            device="cpu",
-        )
-
-        self.model.init_freqs()
-        self.model.eval().requires_grad_(False)
-
-        to_param_dtype_fp32only(self.model, self.param_dtype)
-
-        self.sample_neg_prompt = config.sample_neg_prompt
         self.num_timesteps = num_timesteps
         self.use_timestep_transform = use_timestep_transform
-
         self.model_names = ["model"]
         self.cpu_offload = False
         self.vram_management = False
@@ -302,8 +292,6 @@ class MultiTalkPipeline:
                 teacache_thresh=teacache_thresh,
             )
             logger.info("Teacache initialized")
-        else:
-            self.model.disable_teacache()
 
         input_data = self.audio_encoder.process_input_data(input_data)
         input_prompt = input_data["prompt"]
@@ -359,21 +347,7 @@ class MultiTalkPipeline:
         # preprocess text embedding
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
-        t5_io_time = 0
-        t5_infer_time = 0
-        t5_io_start = time.perf_counter()
-        self.text_encoder.model.to(self.device)
-        t5_io_time += time.perf_counter() - t5_io_start
-        logger.info(f"Text encoder onload time: {t5_io_time} seconds")
-        t5_infer_start = time.perf_counter()
-        context, context_null = self.text_encoder([input_prompt, n_prompt], self.device)
-        t5_infer_time += time.perf_counter() - t5_infer_start
-        logger.info(f"Text encoder inference time: {t5_infer_time} seconds")
-        t5_io_start = time.perf_counter()
-        self.text_encoder.model.cpu()
-        t5_io_time += time.perf_counter() - t5_io_start
-        logger.info(f"Text encoder offload time: {t5_io_time} seconds")
-        torch_gc()
+        context, context_null = self.text_encoder([input_prompt, n_prompt])
 
         # prepare params for video generation
         indices = (torch.arange(2 * 2 + 1) - 2) * 1
@@ -434,7 +408,7 @@ class MultiTalkPipeline:
             msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
             msk = msk.transpose(1, 2).to(self.param_dtype)  # B 4 T H W
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 # get clip embedding
                 clip_io_time = 0
                 clip_io_start = time.perf_counter()
@@ -449,11 +423,12 @@ class MultiTalkPipeline:
                 )
                 clip_infer_time += time.perf_counter() - clip_infer_start
                 logger.info(f"Clip infer time: {clip_infer_time} seconds")
+
                 clip_io_start = time.perf_counter()
                 self.clip.model.cpu()
+                torch_gc()
                 clip_io_time += time.perf_counter() - clip_io_start
                 logger.info(f"Clip offload time: {clip_io_time} seconds")
-                torch_gc()
 
                 # zero padding and vae encode
                 video_frames = torch.zeros(
@@ -540,14 +515,7 @@ class MultiTalkPipeline:
 
             torch_gc()
 
-            @contextmanager
-            def noop_no_sync():
-                yield
-
-            no_sync = getattr(self.model, "no_sync", noop_no_sync)
-
-            # evaluation mode
-            with torch.no_grad(), no_sync():
+            with torch.no_grad():
                 # prepare timesteps
                 timesteps = list(
                     np.linspace(self.num_timesteps, 1, sample_steps, dtype=np.float32)
@@ -602,11 +570,14 @@ class MultiTalkPipeline:
                     "ref_target_masks": ref_target_masks,
                 }
 
-                torch_gc()
-                if not self.vram_management:
-                    self.model.to(self.device)
-                else:
+                if self.vram_management:
                     self.load_models_to_device(["model"])
+                else:
+                    logger.info("Load model to cuda")
+                    start_time = time.perf_counter()
+                    self.model.to(self.device)
+                    end_time = time.perf_counter()
+                    logger.info(f"Model load time: {end_time - start_time} seconds")
 
                 # injecting motion frames
                 if not is_first_clip:
@@ -639,26 +610,36 @@ class MultiTalkPipeline:
                     timestep = timesteps[i]
                     latent_model_input = [latent.to(self.device)]
 
-                    # inference with CFG strategy
                     noise_pred_cond = self.model(
                         latent_model_input, t=timestep, **arg_c
                     )[0]
                     torch_gc()
 
+                    def trace_handler(prof):
+                        print(
+                            prof.key_averages().table(
+                                sort_by="cuda_time_total", row_limit=10
+                            )
+                        )
+
+                    # with torch.profiler.profile(
+                    #     # record_shapes=True,
+                    #     profile_memory=True,
+                    #     on_trace_ready=trace_handler,
+                    #     activities=[ProfilerActivity.CUDA],
+                    # ) as prof:
                     if math.isclose(text_guide_scale, 1.0):
                         noise_pred_drop_audio = self.model(
                             latent_model_input, t=timestep, **arg_null_audio
                         )[0]
-                        torch_gc()
                     else:
                         noise_pred_drop_text = self.model(
                             latent_model_input, t=timestep, **arg_null_text
                         )[0]
-                        torch_gc()
                         noise_pred_uncond = self.model(
                             latent_model_input, t=timestep, **arg_null
                         )[0]
-                        torch_gc()
+                    torch_gc()
                     dit_step_end_time = time.perf_counter()
                     logger.info(
                         f"Dit step {i} end, time: {dit_step_end_time - dit_step_start_time} seconds"
@@ -732,11 +713,23 @@ class MultiTalkPipeline:
                         latent[:, :T_m] = add_latent
 
                     x0 = [latent.to(self.device)]
-                    del latent_model_input, timestep
+                    del (
+                        latent_model_input,
+                        timestep,
+                        noise_pred_cond,
+                        noise_pred_drop_audio,
+                    )
+                    gc.collect()
+                    torch_gc()
 
                 if not self.vram_management:
+                    logger.info("Offload model to cpu")
+                    start_time = time.perf_counter()
                     self.model.cpu()
-                torch_gc()
+                    torch_gc()
+                    end_time = time.perf_counter()
+                    logger.info(f"Model offload time: {end_time - start_time} seconds")
+
                 vae_decode_time = 0
                 vae_decode_start = time.perf_counter()
                 videos = self.vae.decode(x0)
@@ -745,13 +738,13 @@ class MultiTalkPipeline:
 
             # cache generated samples
             videos = torch.stack(videos).cpu()  # B C T H W
+            torch_gc()
             # >>> START OF COLOR CORRECTION STEP <<<
             if color_correction_strength > 0.0 and original_color_reference is not None:
                 videos = match_and_blend_colors(
                     videos, original_color_reference, color_correction_strength
                 )
             # >>> END OF COLOR CORRECTION STEP <<<
-
             if is_first_clip:
                 gen_video_list.append(videos)
             else:
@@ -809,7 +802,7 @@ class MultiTalkPipeline:
 
         del noise, latent
         torch_gc()
-        
+
         if video_save_path is None:
             video_save_path = f"multitalk_video_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
         save_video_ffmpeg(

@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 from einops import rearrange
-from flash_attn import flash_attn_func
+from flash_attn import flash_attn_func as attn_func
+# from sageattention import sageattn as attn_func
 
 from .rope import RotaryPositionalEmbedding1D
 from .utils import normalize_and_scale
@@ -77,7 +78,8 @@ class SingleStreamAttention(nn.Module):
         q = rearrange(q, "B H M K -> B M H K")
         encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
         encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
-        x = flash_attn_func(q, encoder_k, encoder_v)
+        # x = flash_attn_func(q, encoder_k, encoder_v)
+        x = attn_func(q, encoder_k, encoder_v)
         x = rearrange(x, "B M H K -> B H M K")
 
         # linear transform
@@ -128,6 +130,7 @@ class SingleStreamMutiAttention(SingleStreamAttention):
 
         self.rope_1d = RotaryPositionalEmbedding1D(self.head_dim)
 
+    # @torch.compile()
     def forward(
         self,
         x: torch.Tensor,
@@ -206,7 +209,7 @@ class SingleStreamMutiAttention(SingleStreamAttention):
         q = rearrange(q, "B H M K -> B M H K")
         encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
         encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
-        x = flash_attn_func(q, encoder_k, encoder_v)
+        x = attn_func(q, encoder_k, encoder_v)
         x = rearrange(x, "B M H K -> B H M K")
 
         # linear transform

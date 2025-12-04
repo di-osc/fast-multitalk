@@ -1,10 +1,14 @@
 from typing import Tuple
 
 import torch
-from flash_attn import flash_attn_varlen_func
+
+# from flash_attn import flash_attn_func as attn_func
+# from flash_attn import flash_attn_varlen_func as varlen_func
+from sageattention import sageattn_varlen as varlen_func
+from sageattention import sageattn as attn_func
 
 
-def flash_attention(
+def attention_varlen(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -68,7 +72,7 @@ def flash_attention(
     if q_scale is not None:
         q = q * q_scale
 
-    x = flash_attn_varlen_func(
+    x = varlen_func(
         q=q,
         k=k,
         v=v,
@@ -106,7 +110,7 @@ def attention(
     dtype: torch.dtype = torch.bfloat16,
     fa_version: str | None = None,
 ):
-    return flash_attention(
+    return attn_func(
         q=q,
         k=k,
         v=v,

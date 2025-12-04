@@ -27,8 +27,16 @@ def reset_io_spent():
 def cast_to(weight, dtype, device):
     global IO_SPENT
     start = time.perf_counter()
-    r = torch.empty_like(weight, dtype=dtype, device=device)
-    r.copy_(weight)
+    # Handle quantized tensors from torchao
+    if hasattr(weight, "__class__") and "torchao.dtypes" in str(weight.__class__):
+        r = weight.to(device=device)
+    elif hasattr(weight, "__class__") and "torchao.quantization" in str(
+        weight.__class__
+    ):
+        r = weight.to(dtype=dtype, device=device)
+    else:
+        r = torch.empty_like(weight, dtype=dtype, device=device)
+        r.copy_(weight)
     end = time.perf_counter()
     IO_SPENT["cast_to"] += end - start
     return r
