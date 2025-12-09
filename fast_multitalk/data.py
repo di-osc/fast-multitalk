@@ -19,6 +19,7 @@ def save_video_ffmpeg(
     fps: int = 25,
     quality: int = 9,
     encoders: list[str] = ["libx264", "libopenh264"],
+    merge_video_audio: bool = True,
 ):
     """使用ffmpeg命令保存视频和音频到指定路径,视频保存为mp4格式,音频保存为wav格式,并使用指定的编码器进行编码.
 
@@ -65,42 +66,45 @@ def save_video_ffmpeg(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        result = None
-        for encoder in encoders:
-            logger.info(f"Merging video and audio with encoder: {encoder}")
-            merge_video_audio_command = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                str(save_path_tmp),
-                "-i",
-                str(save_path_crop_audio),
-                "-c:v",
-                encoder,
-                "-c:a",
-                "aac",
-                "-shortest",
-                "-movflags",
-                "+faststart",
-                str(save_path),
-            ]
-            # 合并视频和音频
-            try:
-                result = subprocess.run(
-                    merge_video_audio_command, stderr=subprocess.PIPE, check=True
-                )
-                logger.info(
-                    f"Successfully merged video and audio with encoder {encoder}"
-                )
-                break
-            except subprocess.CalledProcessError as e:
-                logger.warning(
-                    f"Failed to merge video and audio with encoder {encoder}: {e.stderr.decode('utf-8')}"
-                )
-                continue
-        if result is None or result.returncode != 0:
-            logger.error("Failed to merge video and audio with any encoder")
-            raise RuntimeError("Failed to merge video and audio")
+        if merge_video_audio:
+            result = None
+            for encoder in encoders:
+                logger.info(f"Merging video and audio with encoder: {encoder}")
+                merge_video_audio_command = [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(save_path_tmp),
+                    "-i",
+                    str(save_path_crop_audio),
+                    "-c:v",
+                    encoder,
+                    "-c:a",
+                    "aac",
+                    "-shortest",
+                    "-movflags",
+                    "+faststart",
+                    str(save_path),
+                ]
+                # 合并视频和音频
+                try:
+                    result = subprocess.run(
+                        merge_video_audio_command, stderr=subprocess.PIPE, check=True
+                    )
+                    logger.info(
+                        f"Successfully merged video and audio with encoder {encoder}"
+                    )
+                    break
+                except subprocess.CalledProcessError as e:
+                    logger.warning(
+                        f"Failed to merge video and audio with encoder {encoder}: {e.stderr.decode('utf-8')}"
+                    )
+                    continue
+            if result is None or result.returncode != 0:
+                logger.error("Failed to merge video and audio with any encoder")
+                raise RuntimeError("Failed to merge video and audio")
+        else:
+            logger.info("Skipping video and audio merge")
         os.remove(save_path_tmp)
         os.remove(save_path_crop_audio)
         os.remove(audio_save_path)

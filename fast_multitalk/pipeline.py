@@ -255,13 +255,13 @@ class MultiTalkPipeline:
         apg_momentum: float = -0.75,
         apg_norm_threshold: float = 55,
         progress: bool = False,
+        merge_video_audio: bool = True,
         **kwargs: Any,
     ):
         """
         Args:
             input_data (str | dict): The input data for video generation. It can be a path to a json file.
             video_save_path (str, optional): The path to save the generated video. Defaults to None.
-            merge_video_audio (bool, optional): Whether to merge video and audio. Defaults to True.
             motion_frame (int, optional): The number of motion frames. Defaults to 25.
             frame_num (int, optional): The number of frames to generate. Defaults to 81.
             shift (float, optional): The shift value for the timestep transform. Defaults to 5.0.
@@ -279,6 +279,7 @@ class MultiTalkPipeline:
             apg_momentum (float, optional): The APG momentum. Defaults to -0.75.
             apg_norm_threshold (float, optional): The APG norm threshold. Defaults to 55.
             progress (bool, optional): Whether to show the progress bar. Defaults to True.
+            merge_video_audio (bool, optional): Whether to merge video and audio. Defaults to True.
         """
         generation_start_time = time.perf_counter()
         seed_everything(seed if seed >= 0 else random.randint(0, 99999999))
@@ -810,6 +811,7 @@ class MultiTalkPipeline:
             gen_video_samples=gen_video_samples[0],
             audio_samples=input_data["video_audio"],
             audio_sample_rate=self.audio_encoder.sample_rate,
+            merge_video_audio=merge_video_audio,
         )
         logger.info(f"Video saved to {video_save_path}")
 
