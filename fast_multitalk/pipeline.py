@@ -12,7 +12,6 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 import torch.profiler
-from torch.profiler import profile, ProfilerActivity
 from tqdm import tqdm
 import optimum.quanto.nn.qlinear as qlinear
 from loguru import logger
@@ -335,13 +334,17 @@ class MultiTalkPipeline:
         elif HUMAN_NUMBER == 2:
             person1_audio_embedding = input_data["cond_audio"]["person1"]
             person2_audio_embedding = input_data["cond_audio"]["person2"]
-            if (
-                person1_audio_embedding.shape[0] <= frame_num
-                or person2_audio_embedding.shape[0] <= frame_num
-            ):
-                raise ValueError(
-                    f"Audio embedding length not satisfies frame nums: {person1_audio_embedding.shape[0]} > {frame_num} and {person2_audio_embedding.shape[0]} > {frame_num}"
+            # Adjust frame_num if any audio is shorter than current frame_num
+            min_audio_length = min(
+                person1_audio_embedding.shape[0], person2_audio_embedding.shape[0]
+            )
+            if min_audio_length <= frame_num:
+                ## frame_num必须是4n+1，如果小于frame_num，则需要截取
+                new_frame_num = min_audio_length // 4 * 4 + 1
+                logger.warning(
+                    f"Audio embedding length not satisfies frame nums: min({person1_audio_embedding.shape[0]}, {person2_audio_embedding.shape[0]}) <= {frame_num}, set frame_num to {new_frame_num}"
                 )
+                frame_num = new_frame_num
             full_audio_embs.append(person1_audio_embedding)
             full_audio_embs.append(person2_audio_embedding)
 
@@ -426,6 +429,7 @@ class MultiTalkPipeline:
                 logger.info(f"Clip infer time: {clip_infer_time} seconds")
 
                 clip_io_start = time.perf_counter()
+                torch.cuda.synchronize()
                 self.clip.model.cpu()
                 torch_gc()
                 clip_io_time += time.perf_counter() - clip_io_start
@@ -763,10 +767,15 @@ class MultiTalkPipeline:
                 videos[:, :, -cur_motion_frames_num:].to(torch.float32).to(self.device)
             )
             audio_start_idx += frame_num - cur_motion_frames_num
+            # Ensure audio_start_idx doesn't go negative for short audio
+            audio_start_idx = max(0, audio_start_idx)
             audio_end_idx = audio_start_idx + clip_length
+            print(f"audio_start_idx: {audio_start_idx}, audio_end_idx: {audio_end_idx}")
 
-            # Repeat audio emb
-            if audio_end_idx >= min(max_frames_num, len(full_audio_embs[0])):
+            # Check if we've reached the end of audio or max frames
+            min_audio_length = min(len(audio) for audio in full_audio_embs)
+            audio_length_limit = min(max_frames_num, min_audio_length)
+            if audio_end_idx >= audio_length_limit:
                 arrive_last_frame = True
                 miss_lengths = []
                 source_frames = []

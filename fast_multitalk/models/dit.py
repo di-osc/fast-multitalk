@@ -946,6 +946,6 @@ def load_quant_wan_multitalk_model(
     map_path = Path(quant_dir) / f"quant_map_{quant}_{distill}.json"
     with open(map_path, "r") as f:
         map_dict = json.load(f)
-    requantize(wan_model, states, map, device="cpu")
+    requantize(wan_model, states, map_dict, device="cpu")
     wan_model.eval().requires_grad_(False)
     return wan_model

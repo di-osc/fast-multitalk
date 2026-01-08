@@ -5,7 +5,6 @@ from pathlib import Path
 
 import torch
 import imageio
-from tqdm import tqdm
 import numpy as np
 import soundfile as sf
 from loguru import logger
