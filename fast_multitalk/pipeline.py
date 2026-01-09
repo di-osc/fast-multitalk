@@ -255,6 +255,7 @@ class MultiTalkPipeline:
         apg_norm_threshold: float = 55,
         progress: bool = False,
         merge_video_audio: bool = True,
+        force_9_16: bool = False,
         **kwargs: Any,
     ):
         """
@@ -279,6 +280,7 @@ class MultiTalkPipeline:
             apg_norm_threshold (float, optional): The APG norm threshold. Defaults to 55.
             progress (bool, optional): Whether to show the progress bar. Defaults to True.
             merge_video_audio (bool, optional): Whether to merge video and audio. Defaults to True.
+            force_9_16 (bool, optional): Whether to force 9:16 aspect ratio. Defaults to False.
         """
         generation_start_time = time.perf_counter()
         seed_everything(seed if seed >= 0 else random.randint(0, 99999999))
@@ -821,6 +823,7 @@ class MultiTalkPipeline:
             audio_samples=input_data["video_audio"],
             audio_sample_rate=self.audio_encoder.sample_rate,
             merge_video_audio=merge_video_audio,
+            force_9_16=force_9_16,
         )
         logger.info(f"Video saved to {video_save_path}")
 
